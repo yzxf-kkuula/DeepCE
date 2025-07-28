@@ -19,12 +19,16 @@ class DeepCE(nn.Module):
         self.use_pert_idose = use_pert_idose
         self.drug_emb_dim = drug_emb_dim
         self.gene_emb_dim = gene_emb_dim
+
         self.drug_fp = NeuralFingerprint(drug_input_dim['atom'], drug_input_dim['bond'], conv_size, drug_emb_dim,
                                          degree, device)
         self.gene_embed = nn.Linear(gene_input_dim, gene_emb_dim)
+
         self.drug_gene_attn = DrugGeneAttention(gene_emb_dim, gene_emb_dim, n_layers=2, n_heads=4, pf_dim=512,
                                                 dropout=dropout, device=device)
+
         self.linear_dim = self.drug_emb_dim + self.gene_emb_dim
+
         if self.use_pert_type:
             self.pert_type_embed = nn.Linear(pert_type_input_dim, pert_type_emb_dim)
             self.linear_dim += pert_type_emb_dim
