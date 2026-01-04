@@ -1,6 +1,6 @@
 import rdkit
 from .molecule_utils import atom_features, bond_features
-from collections import Iterable
+from collections.abc import Iterable
 
 
 degrees = [0, 1, 2, 3, 4, 5]
