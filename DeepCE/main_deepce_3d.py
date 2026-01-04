@@ -1,0 +1,266 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import sys
+from datetime import datetime
+import torch
+import numpy as np
+import argparse
+from models import DeepCE3D
+from utils.datareader_3d import DataReader3D
+from utils import rmse, correlation, precision_k
+
+start_time = datetime.now()
+
+parser = argparse.ArgumentParser(description='DeepCE3D Training with 3D Graph Transformer')
+parser.add_argument('--drug_file', required=True, help='Path to drug SMILES file')
+parser.add_argument('--gene_file', required=True, help='Path to gene feature file')
+parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+parser.add_argument('--train_file', required=True, help='Path to training data')
+parser.add_argument('--dev_file', required=True, help='Path to development data')
+parser.add_argument('--test_file', required=True, help='Path to test data')
+parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+parser.add_argument('--max_epoch', type=int, default=100, help='Maximum number of epochs')
+
+# 3D-specific parameters
+parser.add_argument('--use_3d', action='store_true', default=True, help='Use 3D features')
+parser.add_argument('--fusion_type', type=str, default='concat', 
+                   choices=['concat', 'add', 'gated', 'attention'],
+                   help='Type of feature fusion')
+parser.add_argument('--graph_3d_dim', type=int, default=128, help='Hidden dimension for 3D graph transformer')
+parser.add_argument('--graph_3d_n_heads', type=int, default=4, help='Number of attention heads in 3D transformer')
+parser.add_argument('--graph_3d_n_layers', type=int, default=2, help='Number of layers in 3D transformer')
+parser.add_argument('--graph_3d_d_ff', type=int, default=512, help='Feedforward dimension in 3D transformer')
+
+args = parser.parse_args()
+
+drug_file = args.drug_file
+gene_file = args.gene_file
+dropout = args.dropout
+gene_expression_file_train = args.train_file
+gene_expression_file_dev = args.dev_file
+gene_expression_file_test = args.test_file
+batch_size = args.batch_size
+max_epoch = args.max_epoch
+
+# parameters initialization
+drug_input_dim = {'atom': 62, 'bond': 6}
+drug_embed_dim = 128
+drug_target_embed_dim = 128
+conv_size = [16, 16]
+degree = [0, 1, 2, 3, 4, 5]
+gene_embed_dim = 128
+pert_type_emb_dim = 4
+cell_id_emb_dim = 4
+pert_idose_emb_dim = 4
+hid_dim = 128
+num_gene = 978
+precision_degree = [10, 20, 50, 100]
+loss_type = 'point_wise_mse'
+intitializer = torch.nn.init.xavier_uniform_
+filter = {"time": "24H", "pert_id": ['BRD-U41416256', 'BRD-U60236422'], "pert_type": ["trt_cp"],
+          "cell_id": ['A375', 'HA1E', 'HELA', 'HT29', 'MCF7', 'PC3', 'YAPC'],
+          "pert_idose": ["0.04 um", "0.12 um", "0.37 um", "1.11 um", "3.33 um", "10.0 um"]}
+
+# check cuda
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+print("Use GPU: %s" % torch.cuda.is_available())
+
+data = DataReader3D(drug_file, gene_file, gene_expression_file_train, gene_expression_file_dev,
+                    gene_expression_file_test, filter, device)
+print('#Train: %d' % len(data.train_feature['drug']))
+print('#Dev: %d' % len(data.dev_feature['drug']))
+print('#Test: %d' % len(data.test_feature['drug']))
+
+
+# model creation
+model = DeepCE3D(drug_input_dim=drug_input_dim, drug_emb_dim=drug_embed_dim,
+                 conv_size=conv_size, degree=degree, gene_input_dim=np.shape(data.gene)[1],
+                 gene_emb_dim=gene_embed_dim, num_gene=np.shape(data.gene)[0], hid_dim=hid_dim, dropout=dropout,
+                 loss_type=loss_type, device=device, initializer=intitializer,
+                 pert_type_input_dim=len(filter['pert_type']), cell_id_input_dim=len(filter['cell_id']),
+                 pert_idose_input_dim=len(filter['pert_idose']), pert_type_emb_dim=pert_type_emb_dim,
+                 cell_id_emb_dim=cell_id_emb_dim, pert_idose_emb_dim=pert_idose_emb_dim,
+                 use_pert_type=data.use_pert_type, use_cell_id=data.use_cell_id,
+                 use_pert_idose=data.use_pert_idose,
+                 # 3D parameters
+                 use_3d=args.use_3d, fusion_type=args.fusion_type,
+                 graph_3d_dim=args.graph_3d_dim, graph_3d_n_heads=args.graph_3d_n_heads,
+                 graph_3d_n_layers=args.graph_3d_n_layers, graph_3d_d_ff=args.graph_3d_d_ff)
+model.to(device)
+model = model.double()
+
+print(f"\nModel Configuration:")
+print(f"  Use 3D: {args.use_3d}")
+if args.use_3d:
+    print(f"  Fusion Type: {args.fusion_type}")
+    print(f"  3D Transformer Dim: {args.graph_3d_dim}")
+    print(f"  3D Transformer Heads: {args.graph_3d_n_heads}")
+    print(f"  3D Transformer Layers: {args.graph_3d_n_layers}")
+    print(f"  3D Transformer FF Dim: {args.graph_3d_d_ff}")
+
+# training
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
+best_dev_loss = float("inf")
+best_dev_pearson = float("-inf")
+pearson_list_dev = []
+pearson_list_test = []
+spearman_list_dev = []
+spearman_list_test = []
+rmse_list_dev = []
+rmse_list_test = []
+precisionk_list_dev = []
+precisionk_list_test = []
+pearson_raw_list = []
+
+for epoch in range(max_epoch):
+    print("Iteration %d:" % (epoch+1))
+    model.train()
+    epoch_loss = 0
+    for i, batch in enumerate(data.get_batch_data(dataset='train', batch_size=batch_size, shuffle=True)):
+        ft, lb = batch
+        drug = ft['drug']
+        mask = ft['mask']
+        smiles = ft['smiles'] if args.use_3d else None
+        if data.use_pert_type:
+            pert_type = ft['pert_type']
+        else:
+            pert_type = None
+        if data.use_cell_id:
+            cell_id = ft['cell_id']
+        else:
+            cell_id = None
+        if data.use_pert_idose:
+            pert_idose = ft['pert_idose']
+        else:
+            pert_idose = None
+        optimizer.zero_grad()
+        predict = model(drug, data.gene, mask, pert_type, cell_id, pert_idose, smiles)
+        loss = model.loss(lb, predict)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    print('Train loss:')
+    print(epoch_loss/(i+1))
+
+    model.eval()
+
+    epoch_loss = 0
+    lb_np = np.empty([0, num_gene])
+    predict_np = np.empty([0, num_gene])
+    with torch.no_grad():
+        for i, batch in enumerate(data.get_batch_data(dataset='dev', batch_size=batch_size, shuffle=False)):
+            ft, lb = batch
+            drug = ft['drug']
+            mask = ft['mask']
+            smiles = ft['smiles'] if args.use_3d else None
+            if data.use_pert_type:
+                pert_type = ft['pert_type']
+            else:
+                pert_type = None
+            if data.use_cell_id:
+                cell_id = ft['cell_id']
+            else:
+                cell_id = None
+            if data.use_pert_idose:
+                pert_idose = ft['pert_idose']
+            else:
+                pert_idose = None
+            predict = model(drug, data.gene, mask, pert_type, cell_id, pert_idose, smiles)
+            loss = model.loss(lb, predict)
+            epoch_loss += loss.item()
+            lb_np = np.concatenate((lb_np, lb.cpu().numpy()), axis=0)
+            predict_np = np.concatenate((predict_np, predict.cpu().numpy()), axis=0)
+        print('Dev loss:')
+        print(epoch_loss / (i + 1))
+        rmse_score = rmse(lb_np, predict_np)
+        rmse_list_dev.append(rmse_score)
+        print('RMSE: %.4f' % rmse_score)
+        pearson, _ = correlation(lb_np, predict_np, 'pearson')
+        pearson_list_dev.append(pearson)
+        print('Pearson\'s correlation: %.4f' % pearson)
+        spearman, _ = correlation(lb_np, predict_np, 'spearman')
+        spearman_list_dev.append(spearman)
+        print('Spearman\'s correlation: %.4f' % spearman)
+        precision = []
+        for k in precision_degree:
+            precision_neg, precision_pos = precision_k(lb_np, predict_np, k)
+            print("Precision@%d Positive: %.4f" % (k, precision_pos))
+            print("Precision@%d Negative: %.4f" % (k, precision_neg))
+            precision.append([precision_pos, precision_neg])
+        precisionk_list_dev.append(precision)
+
+        if best_dev_pearson < pearson:
+            best_dev_pearson = pearson
+
+    epoch_loss = 0
+    lb_np = np.empty([0, num_gene])
+    predict_np = np.empty([0, num_gene])
+    with torch.no_grad():
+        for i, batch in enumerate(data.get_batch_data(dataset='test', batch_size=batch_size, shuffle=False)):
+            ft, lb = batch
+            drug = ft['drug']
+            mask = ft['mask']
+            smiles = ft['smiles'] if args.use_3d else None
+            if data.use_pert_type:
+                pert_type = ft['pert_type']
+            else:
+                pert_type = None
+            if data.use_cell_id:
+                cell_id = ft['cell_id']
+            else:
+                cell_id = None
+            if data.use_pert_idose:
+                pert_idose = ft['pert_idose']
+            else:
+                pert_idose = None
+            predict = model(drug, data.gene, mask, pert_type, cell_id, pert_idose, smiles)
+            loss = model.loss(lb, predict)
+            epoch_loss += loss.item()
+            lb_np = np.concatenate((lb_np, lb.cpu().numpy()), axis=0)
+            predict_np = np.concatenate((predict_np, predict.cpu().numpy()), axis=0)
+        print('Test loss:')
+        print(epoch_loss / (i + 1))
+        rmse_score = rmse(lb_np, predict_np)
+        rmse_list_test.append(rmse_score)
+        print('RMSE: %.4f' % rmse_score)
+        pearson, _ = correlation(lb_np, predict_np, 'pearson')
+        pearson_list_test.append(pearson)
+        print('Pearson\'s correlation: %.4f' % pearson)
+        spearman, _ = correlation(lb_np, predict_np, 'spearman')
+        spearman_list_test.append(spearman)
+        print('Spearman\'s correlation: %.4f' % spearman)
+        precision = []
+        for k in precision_degree:
+            precision_neg, precision_pos = precision_k(lb_np, predict_np, k)
+            print("Precision@%d Positive: %.4f" % (k, precision_pos))
+            print("Precision@%d Negative: %.4f" % (k, precision_neg))
+            precision.append([precision_pos, precision_neg])
+        precisionk_list_test.append(precision)
+
+best_dev_epoch = np.argmax(pearson_list_dev)
+print("Epoch %d got best Pearson's correlation on dev set: %.4f" % (best_dev_epoch + 1, pearson_list_dev[best_dev_epoch]))
+print("Epoch %d got Spearman's correlation on dev set: %.4f" % (best_dev_epoch + 1, spearman_list_dev[best_dev_epoch]))
+print("Epoch %d got RMSE on dev set: %.4f" % (best_dev_epoch + 1, rmse_list_dev[best_dev_epoch]))
+print("Epoch %d got P@100 POS and NEG on dev set: %.4f, %.4f" % (best_dev_epoch + 1,
+                                                                  precisionk_list_dev[best_dev_epoch][-1][0],
+                                                                  precisionk_list_dev[best_dev_epoch][-1][1]))
+
+print("Epoch %d got Pearson's correlation on test set w.r.t dev set: %.4f" % (best_dev_epoch + 1, pearson_list_test[best_dev_epoch]))
+print("Epoch %d got Spearman's correlation on test set w.r.t dev set: %.4f" % (best_dev_epoch + 1, spearman_list_test[best_dev_epoch]))
+print("Epoch %d got RMSE on test set w.r.t dev set: %.4f" % (best_dev_epoch + 1, rmse_list_test[best_dev_epoch]))
+print("Epoch %d got P@100 POS and NEG on test set w.r.t dev set: %.4f, %.4f" % (best_dev_epoch + 1,
+                                                                  precisionk_list_test[best_dev_epoch][-1][0],
+                                                                  precisionk_list_test[best_dev_epoch][-1][1]))
+
+best_test_epoch = np.argmax(pearson_list_test)
+print("Epoch %d got best Pearson's correlation on test set: %.4f" % (best_test_epoch + 1, pearson_list_test[best_test_epoch]))
+print("Epoch %d got Spearman's correlation on test set: %.4f" % (best_test_epoch + 1, spearman_list_test[best_test_epoch]))
+print("Epoch %d got RMSE on test set: %.4f" % (best_test_epoch + 1, rmse_list_test[best_test_epoch]))
+print("Epoch %d got P@100 POS and NEG on test set: %.4f, %.4f" % (best_test_epoch + 1,
+                                                                  precisionk_list_test[best_test_epoch][-1][0],
+                                                                  precisionk_list_test[best_test_epoch][-1][1]))
+end_time = datetime.now()
+print(end_time - start_time)
